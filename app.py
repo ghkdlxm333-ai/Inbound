@@ -90,23 +90,58 @@ def find_column(columns, candidates):
 # ============================================================
 
 def parse_date_header(value, target_year):
+    """
+    원본의 날짜 헤더를 실제 날짜로 변환한다.
+
+    지원 예:
+    - 2026-09-01 / 2026.09.01 / 2026/09/01
+    - 26년 9월 1일 / 2026년 9월 1일
+    - 9월 1일 / 09월 01일
+    - 9.1 / 09.01 / 9/1 / 09/01
+    - 9월 1일(화), 9/1(화) 등 요일 표기가 붙은 경우
+    """
+    if pd.isna(value):
+        return None
+
+    # Excel이 날짜형으로 읽은 경우
     if isinstance(value, (pd.Timestamp, datetime, date)):
-        return pd.Timestamp(value).normalize()
+        try:
+            return pd.Timestamp(value).normalize()
+        except Exception:
+            return None
 
     value = normalize_text(value)
 
     if not value:
         return None
 
+    # 날짜가 아닌 헤더 제외
     if any(
         word.lower() in value.lower()
         for word in EXCLUDE_DATE_WORDS
     ):
         return None
 
-    # 2026-09-01
+    # 줄바꿈/앞뒤 공백 정리
+    value = re.sub(r"\s+", " ", value).strip()
+
+    # 요일 표기 제거: (월), (화), 월, 화 등
+    value = re.sub(
+        r"\s*\([월화수목금토일]\)\s*$",
+        "",
+        value,
+    )
+    value = re.sub(
+        r"\s*[월화수목금토일]\s*$",
+        "",
+        value,
+    ).strip()
+
+    # ---------------------------------------------------------
+    # 1) YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD
+    # ---------------------------------------------------------
     match = re.fullmatch(
-        r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})",
+        r"(\d{4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})",
         value,
     )
 
@@ -118,7 +153,29 @@ def parse_date_header(value, target_year):
         except ValueError:
             return None
 
-    # 9월 1일
+    # ---------------------------------------------------------
+    # 2) 26년 9월 1일 / 2026년 9월 1일
+    # ---------------------------------------------------------
+    match = re.fullmatch(
+        r"(\d{2,4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일?",
+        value,
+    )
+
+    if match:
+        year_text, month, day = match.groups()
+        year = int(year_text)
+
+        if len(year_text) == 2:
+            year += 2000
+
+        try:
+            return pd.Timestamp(year, int(month), int(day))
+        except ValueError:
+            return None
+
+    # ---------------------------------------------------------
+    # 3) 9월 1일 / 09월 01일
+    # ---------------------------------------------------------
     match = re.fullmatch(
         r"(\d{1,2})\s*월\s*(\d{1,2})\s*일?",
         value,
@@ -132,7 +189,9 @@ def parse_date_header(value, target_year):
         except ValueError:
             return None
 
-    # 9. 1 / 09.01 / 9/1
+    # ---------------------------------------------------------
+    # 4) 9.1 / 09.01 / 9/1 / 09/01
+    # ---------------------------------------------------------
     match = re.fullmatch(
         r"(\d{1,2})\s*[./]\s*(\d{1,2})",
         value,
@@ -145,6 +204,24 @@ def parse_date_header(value, target_year):
             return pd.Timestamp(target_year, month, day)
         except ValueError:
             return None
+
+    # ---------------------------------------------------------
+    # 5) 기타 Excel/문자열 날짜 형식
+    #    단, 선택한 연/월과 일치하는 경우만 인정
+    # ---------------------------------------------------------
+    try:
+        parsed = pd.to_datetime(
+            value,
+            errors="coerce",
+        )
+
+        if pd.notna(parsed):
+            parsed = pd.Timestamp(parsed).normalize()
+
+            if parsed.year == target_year:
+                return parsed
+    except Exception:
+        pass
 
     return None
 
@@ -802,6 +879,14 @@ if not date_columns:
         f"{target_year}년 "
         f"{target_month}월 날짜 컬럼을 "
         "찾지 못했습니다."
+    )
+
+    # 원본 헤더를 확인할 수 있도록 표시
+    st.info(
+        "현재 인식된 원본 컬럼명 일부: "
+        + ", ".join(
+            [str(c) for c in raw_df.columns[:80]]
+        )
     )
 
     st.stop()
