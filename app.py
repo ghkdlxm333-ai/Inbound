@@ -1,162 +1,1341 @@
+```python
+import math
 import re
-from io import BytesIO
-from pathlib import Path
+from datetime import date, datetime
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title='입고 예정 PLT Dashboard', page_icon='📦', layout='wide')
-st.title('📦 입고 예정 PLT Dashboard')
-st.caption('PU팀 입고 예정 PCS → 일자별·창고별 PLT 자동 환산')
 
-ALIASES = {
-    'sku': ['SKU ID','SKU','SKU_ID'],
-    'product': ['제품 모델명','제품명','상품명','Product'],
-    'line': ['라인','라인명','Line'],
-    'pallet': ['팔레트 당 제품 수량','팔레트당 제품 수량','팔레트 당 PCS','Pallet Qty'],
-}
-EXCLUDE = ['협의중','합계','total','s&op','sop','누계']
-UNMAPPED = '미매핑'
+# ============================================================
+# PAGE
+# ============================================================
 
-def clean(x):
-    return re.sub(r'\s+', ' ', str(x).replace('\n',' ')).strip()
+st.set_page_config(
+    page_title="창고별·일자별 입고 예정 PLT Dashboard",
+    page_icon="📦",
+    layout="wide",
+)
 
-def find_col(df, aliases):
-    cols = {clean(c): c for c in df.columns}
-    for a in aliases:
-        if a in cols: return cols[a]
-    for c0,c in cols.items():
-        for a in aliases:
-            if a in c0: return c
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+EXCLUDE_DATE_WORDS = [
+    "협의중",
+    "합계",
+    "total",
+    "누계",
+    "s&op",
+    "sop",
+]
+
+
+# ============================================================
+# BASIC FUNCTIONS
+# ============================================================
+
+def clean_col_name(value):
+    if pd.isna(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip())
+
+
+def normalize_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def to_number(series):
+    return pd.to_numeric(
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .replace({
+            "": None,
+            "nan": None,
+            "None": None,
+        }),
+        errors="coerce",
+    )
+
+
+def find_column(columns, candidates):
+    columns = list(columns)
+
+    # 정확히 일치
+    for candidate in candidates:
+        candidate = clean_col_name(candidate)
+
+        for column in columns:
+            if clean_col_name(column) == candidate:
+                return column
+
+    # 부분 일치
+    for candidate in candidates:
+        candidate = clean_col_name(candidate)
+
+        for column in columns:
+            if candidate and candidate in clean_col_name(column):
+                return column
+
     return None
 
-def parse_header(x):
-    s = clean(x); lo = s.lower()
-    if any(k in lo for k in EXCLUDE): return None
-    m = re.search(r'(20\d{2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})', s)
-    if m: return int(m.group(2)), int(m.group(3))
-    m = re.search(r'(\d{1,2})\s*월\s*(\d{1,2})\s*일?', s)
-    if m: return int(m.group(1)), int(m.group(2))
-    m = re.search(r'(?<!\d)(\d{1,2})\s*[./-]\s*(\d{1,2})(?!\d)', s)
-    if m:
-        mo,day = map(int,m.groups())
-        if 1 <= mo <= 12 and 1 <= day <= 31: return mo,day
-    p = pd.to_datetime(x, errors='coerce')
-    if pd.notna(p): return int(p.month),int(p.day)
+
+# ============================================================
+# DATE DETECTION
+# ============================================================
+
+def parse_date_header(value, target_year):
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return pd.Timestamp(value).normalize()
+
+    value = normalize_text(value)
+
+    if not value:
+        return None
+
+    if any(
+        word.lower() in value.lower()
+        for word in EXCLUDE_DATE_WORDS
+    ):
+        return None
+
+    # 2026-09-01
+    match = re.fullmatch(
+        r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})",
+        value,
+    )
+
+    if match:
+        year, month, day = map(int, match.groups())
+
+        try:
+            return pd.Timestamp(year, month, day)
+        except ValueError:
+            return None
+
+    # 9월 1일
+    match = re.fullmatch(
+        r"(\d{1,2})\s*월\s*(\d{1,2})\s*일?",
+        value,
+    )
+
+    if match:
+        month, day = map(int, match.groups())
+
+        try:
+            return pd.Timestamp(target_year, month, day)
+        except ValueError:
+            return None
+
+    # 9. 1 / 09.01 / 9/1
+    match = re.fullmatch(
+        r"(\d{1,2})\s*[./]\s*(\d{1,2})",
+        value,
+    )
+
+    if match:
+        month, day = map(int, match.groups())
+
+        try:
+            return pd.Timestamp(target_year, month, day)
+        except ValueError:
+            return None
+
     return None
 
-def date_cols(df, month=None):
-    out=[]
-    for c in df.columns:
-        p=parse_header(c)
-        if p and (month is None or p[0]==month): out.append((c,p[0],p[1]))
-    return out
 
-def numeric(s):
-    return pd.to_numeric(s.astype(str).str.replace(',','',regex=False).str.replace(' ','',regex=False),errors='coerce')
+def detect_date_columns(
+    df,
+    target_year,
+    target_month,
+):
+    detected = []
 
-def read_file(f):
-    ext=Path(f.name).suffix.lower()
-    if ext in ('.xlsx','.xls'):
-        return {s:pd.read_excel(f,sheet_name=s) for s in pd.ExcelFile(f).sheet_names}
-    raw=f.getvalue()
-    for enc in ('utf-8-sig','cp949','euc-kr','utf-8'):
-        try: return {'CSV':pd.read_csv(BytesIO(raw),encoding=enc)}
-        except Exception: pass
-    raise ValueError('CSV 인코딩을 읽을 수 없습니다.')
+    for column in df.columns:
+        parsed = parse_date_header(
+            column,
+            target_year,
+        )
 
-def transform(raw, year, month, mapping=None, roundup=True):
-    df=raw.copy(); df.columns=[clean(c) for c in df.columns]
-    sku=find_col(df,ALIASES['sku']); product=find_col(df,ALIASES['product']); line=find_col(df,ALIASES['line']); pallet=find_col(df,ALIASES['pallet'])
-    if not sku: raise ValueError('SKU ID 컬럼을 찾지 못했습니다.')
-    if not pallet: raise ValueError('팔레트 당 제품 수량 컬럼을 찾지 못했습니다.')
-    dcols=date_cols(df,month)
-    if not dcols: raise ValueError(f'{month}월 날짜 컬럼을 찾지 못했습니다.')
-    ids=[sku,pallet]+([product] if product else [])+([line] if line else [])
-    ids=list(dict.fromkeys(ids)); names=[x[0] for x in dcols]
-    out=df[ids+names].melt(id_vars=ids,value_vars=names,var_name='입고일자_raw',value_name='입고 PCS')
-    mapping_date={c:pd.Timestamp(year=year,month=mo,day=day) for c,mo,day in dcols}
-    out['입고일자']=out['입고일자_raw'].map(mapping_date); out['입고 PCS']=numeric(out['입고 PCS']); out['팔레트당 PCS']=numeric(out[pallet])
-    out=out[out['입고 PCS'].notna() & (out['입고 PCS']!=0)].copy()
-    out['SKU ID']=out[sku].astype(str).str.strip(); out['제품명']=out[product].astype(str).str.strip() if product else ''; out['라인']=out[line].astype(str).str.strip() if line else ''
-    if mapping is not None and {'라인','창고'}.issubset(mapping.columns):
-        mp=mapping[['라인','창고']].drop_duplicates('라인').copy(); out=out.merge(mp,on='라인',how='left')
-    else: out['창고']=UNMAPPED
-    out['창고']=out['창고'].fillna(UNMAPPED)
-    valid=out['팔레트당 PCS'].gt(0)
-    ratio=out['입고 PCS']/out['팔레트당 PCS']
-    out['입고 PLT']=ratio.where(valid)
-    if roundup: out.loc[valid,'입고 PLT']=ratio.loc[valid].apply(lambda x:int(-(-x//1)))
-    out['입고 PLT']=pd.to_numeric(out['입고 PLT'],errors='coerce')
-    return out.sort_values(['입고일자','창고','SKU ID']).reset_index(drop=True), dcols
+        if parsed is not None:
+            if (
+                parsed.year == target_year
+                and parsed.month == target_month
+            ):
+                detected.append(
+                    (column, parsed)
+                )
 
-with st.sidebar:
-    st.header('⚙️ 설정')
-    year=st.number_input('입고 연도',2020,2035,2026)
-    month=st.selectbox('분석 월',range(1,13),index=8,format_func=lambda x:f'{x}월')
-    roundup=st.checkbox('부분 팔레트 올림 (ROUNDUP)',True)
-    st.caption('현재 원본에는 창고 컬럼이 명확하지 않아 LINE → 창고 매핑을 사용합니다.')
+    detected.sort(
+        key=lambda x: x[1]
+    )
 
-uploaded=st.file_uploader('PU 입고 예정 파일을 업로드하세요',type=['xlsx','xls','csv'])
-if uploaded is None:
-    st.info('월별 PU Excel/CSV를 업로드하면 날짜 컬럼을 자동 인식하고 PLT Dashboard를 생성합니다.')
-    st.markdown('**자동 인식 대상:** SKU ID / 제품 모델명 / 라인 / 팔레트 당 제품 수량 / 날짜 컬럼\n\n**자동 제외:** 협의중 / 합계 / S&OP / 누계')
+    return detected
+
+
+# ============================================================
+# WAREHOUSE MAPPING
+# ============================================================
+
+def determine_warehouse(
+    category,
+    product_name,
+):
+    category = normalize_text(category)
+    product_name = normalize_text(product_name)
+
+    # 국내
+    if category == "국내":
+        return "부발4층"
+
+    # 그레이스
+    if category == "그레이스":
+        return "그레이스"
+
+    # 대만
+    if category == "대만":
+        return "대만"
+
+    # 세포라
+    if category == "세포라":
+        return "세포라"
+
+    # 슬리브X
+    if category == "슬리브X":
+        return "슬리브X"
+
+    # 일본
+    if category == "일본":
+        return "어크로스비"
+
+    # 직납
+    if category == "직납":
+        return "직납"
+
+    # 캐나다
+    if category == "캐나다":
+        return "영문 부발4층"
+
+    # 글로벌
+    if category == "글로벌":
+
+        if (
+            "EF" in product_name
+            or "글로벌" in product_name
+        ):
+            return "안성개정"
+
+        if (
+            "EU" in product_name
+            or "유럽" in product_name
+        ):
+            return "부발1,2층"
+
+    # 어크로스
+    if category == "어크로스":
+
+        if (
+            "일문" in product_name
+            or "JP" in product_name
+        ):
+            return "어크로스비"
+
+    # 영문
+    if category == "영문":
+
+        if (
+            "영문" in product_name
+            or "글로벌" in product_name
+        ):
+            return "안성개성"
+
+    # 유럽/영국
+    if category == "유럽/영국":
+
+        if (
+            "EU" in product_name
+            or "유럽재고" in product_name
+        ):
+            return "부발1,2층"
+
+    # 아르고 계열
+    if category.startswith("아르고"):
+        return category
+
+    # 미매핑
+    return "미매핑"
+
+
+# ============================================================
+# PLT CALCULATION
+# ============================================================
+
+def calculate_plt(
+    pcs,
+    pallet_qty,
+    round_partial=True,
+):
+    if pd.isna(pcs):
+        return 0
+
+    if pd.isna(pallet_qty):
+        return 0
+
+    try:
+        pcs = float(pcs)
+        pallet_qty = float(pallet_qty)
+    except (TypeError, ValueError):
+        return 0
+
+    if pcs <= 0:
+        return 0
+
+    if pallet_qty <= 0:
+        return 0
+
+    result = pcs / pallet_qty
+
+    if round_partial:
+        return math.ceil(result)
+
+    return result
+
+
+# ============================================================
+# FILE READ
+# ============================================================
+
+def read_uploaded_file(uploaded_file):
+
+    filename = uploaded_file.name.lower()
+
+    if filename.endswith(
+        (".xlsx", ".xls")
+    ):
+        return pd.read_excel(
+            uploaded_file,
+            sheet_name=None,
+            dtype=object,
+        )
+
+    if filename.endswith(".csv"):
+
+        raw = uploaded_file.getvalue()
+
+        from io import BytesIO
+
+        for encoding in [
+            "utf-8-sig",
+            "cp949",
+            "euc-kr",
+            "utf-8",
+        ]:
+            try:
+                return {
+                    "CSV": pd.read_csv(
+                        BytesIO(raw),
+                        encoding=encoding,
+                        dtype=object,
+                    )
+                }
+            except UnicodeDecodeError:
+                continue
+
+        raise ValueError(
+            "CSV 파일의 인코딩을 읽을 수 없습니다."
+        )
+
+    raise ValueError(
+        "xlsx, xls, csv 파일만 지원합니다."
+    )
+
+
+# ============================================================
+# SOURCE COLUMN DETECTION
+# ============================================================
+
+def detect_source_columns(df):
+
+    columns = list(df.columns)
+
+    return {
+        "sku": find_column(
+            columns,
+            [
+                "SKU ID",
+                "SKU",
+                "품목코드",
+                "상품코드",
+            ],
+        ),
+
+        "product": find_column(
+            columns,
+            [
+                "제품 모델명",
+                "제품명",
+                "상품명",
+                "상품명칭",
+            ],
+        ),
+
+        "barcode": find_column(
+            columns,
+            [
+                "바코드",
+                "Barcode",
+                "BARCODE",
+            ],
+        ),
+
+        "category": find_column(
+            columns,
+            [
+                "라인",
+                "구분",
+                "카테고리",
+            ],
+        ),
+
+        "pallet_qty": find_column(
+            columns,
+            [
+                "팔레트당 제품 수량",
+                "팔레트 당 제품 수량",
+                "PLT당 PCS 적재 수량",
+                "팔레트당 PCS",
+            ],
+        ),
+    }
+
+
+# ============================================================
+# WIDE → LONG
+# ============================================================
+
+def transform_inbound_data(
+    df,
+    date_columns,
+    mapping,
+    round_partial=True,
+):
+
+    required = [
+        "sku",
+        "product",
+        "category",
+        "pallet_qty",
+    ]
+
+    missing = [
+        key
+        for key in required
+        if mapping.get(key) is None
+    ]
+
+    if missing:
+        raise ValueError(
+            "필수 컬럼을 찾지 못했습니다: "
+            + ", ".join(missing)
+        )
+
+    sku_col = mapping["sku"]
+    product_col = mapping["product"]
+    barcode_col = mapping["barcode"]
+    category_col = mapping["category"]
+    pallet_col = mapping["pallet_qty"]
+
+    base = pd.DataFrame()
+
+    base["SKU ID"] = (
+        df[sku_col]
+        .map(normalize_text)
+    )
+
+    base["제품명"] = (
+        df[product_col]
+        .map(normalize_text)
+    )
+
+    if barcode_col:
+        base["바코드"] = (
+            df[barcode_col]
+            .map(normalize_text)
+        )
+    else:
+        base["바코드"] = ""
+
+    base["구분"] = (
+        df[category_col]
+        .map(normalize_text)
+    )
+
+    base["팔레트당 제품 수량"] = (
+        to_number(
+            df[pallet_col]
+        )
+    )
+
+    source_date_columns = [
+        column
+        for column, _ in date_columns
+    ]
+
+    for column in source_date_columns:
+        base[column] = to_number(
+            df[column]
+        )
+
+    # 가로형 날짜 데이터를 세로형으로 변환
+    inbound_data = base.melt(
+        id_vars=[
+            "SKU ID",
+            "제품명",
+            "바코드",
+            "구분",
+            "팔레트당 제품 수량",
+        ],
+        value_vars=source_date_columns,
+        var_name="입고일자_원본",
+        value_name="입고 PCS",
+    )
+
+    # 날짜 매핑
+    date_map = {
+        column: parsed
+        for column, parsed in date_columns
+    }
+
+    inbound_data["입고일자"] = (
+        inbound_data[
+            "입고일자_원본"
+        ].map(date_map)
+    )
+
+    # PCS 숫자화
+    inbound_data["입고 PCS"] = (
+        pd.to_numeric(
+            inbound_data["입고 PCS"],
+            errors="coerce",
+        )
+        .fillna(0)
+    )
+
+    # 0 PCS 제거
+    inbound_data = inbound_data[
+        inbound_data["입고 PCS"] > 0
+    ].copy()
+
+    # 창고 매핑
+    inbound_data["창고"] = (
+        inbound_data.apply(
+            lambda row:
+                determine_warehouse(
+                    row["구분"],
+                    row["제품명"],
+                ),
+            axis=1,
+        )
+    )
+
+    # PLT 계산
+    inbound_data["입고 예정 PLT"] = (
+        inbound_data.apply(
+            lambda row:
+                calculate_plt(
+                    row["입고 PCS"],
+                    row[
+                        "팔레트당 제품 수량"
+                    ],
+                    round_partial,
+                ),
+            axis=1,
+        )
+    )
+
+    inbound_data["입고일자"] = (
+        pd.to_datetime(
+            inbound_data["입고일자"],
+            errors="coerce",
+        )
+    )
+
+    return (
+        inbound_data
+        .sort_values(
+            [
+                "입고일자",
+                "창고",
+                "제품명",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def make_validation(
+    inbound_data,
+):
+
+    return {
+        "전체 입고 PCS":
+            inbound_data[
+                "입고 PCS"
+            ].sum(),
+
+        "전체 입고 예정 PLT":
+            inbound_data[
+                "입고 예정 PLT"
+            ].sum(),
+
+        "SKU 수":
+            inbound_data[
+                "SKU ID"
+            ].nunique(),
+
+        "미매핑 건수":
+            (
+                inbound_data[
+                    "창고"
+                ] == "미매핑"
+            ).sum(),
+
+        "팔레트 수량 누락":
+            (
+                inbound_data[
+                    "팔레트당 제품 수량"
+                ].isna()
+                |
+                (
+                    inbound_data[
+                        "팔레트당 제품 수량"
+                    ] <= 0
+                )
+            ).sum(),
+
+        "입고 데이터 건수":
+            len(inbound_data),
+    }
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.header("설정")
+
+target_year = st.sidebar.number_input(
+    "연도",
+    min_value=2020,
+    max_value=2100,
+    value=2026,
+    step=1,
+)
+
+target_month = st.sidebar.selectbox(
+    "대상 월",
+    list(range(1, 13)),
+    index=8,
+    format_func=lambda x:
+        f"{x}월",
+)
+
+round_partial = st.sidebar.checkbox(
+    "부분 팔레트 올림",
+    value=True,
+)
+
+
+# ============================================================
+# TITLE
+# ============================================================
+
+st.title(
+    "📦 창고별 · 일자별 입고 예정 PLT Dashboard"
+)
+
+st.caption(
+    "PU팀 SCM 입고 예정 PCS → "
+    "창고별 / 일자별 입고 예정 PLT 자동 환산"
+)
+
+
+# ============================================================
+# FILE UPLOAD
+# ============================================================
+
+uploaded_file = st.file_uploader(
+    "PU 입고 일정 파일 업로드",
+    type=[
+        "xlsx",
+        "xls",
+        "csv",
+    ],
+)
+
+if uploaded_file is None:
+
+    st.info(
+        "PU 입고 일정 파일을 업로드하세요."
+    )
+
     st.stop()
 
-try: sheets=read_file(uploaded)
-except Exception as e: st.error(f'파일을 읽지 못했습니다: {e}'); st.stop()
-sheet=st.selectbox('분석할 시트',list(sheets.keys())); raw=sheets[sheet].copy(); raw.columns=[clean(c) for c in raw.columns]
-all_dates=date_cols(raw); target_dates=date_cols(raw,month)
 
-with st.expander('🔎 자동 인식 결과',expanded=True):
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric('SKU 컬럼',find_col(raw,ALIASES['sku']) or '미검출'); c2.metric('제품명',find_col(raw,ALIASES['product']) or '미검출'); c3.metric('라인',find_col(raw,ALIASES['line']) or '미검출'); c4.metric('팔레트당 PCS',find_col(raw,ALIASES['pallet']) or '미검출')
-    st.write(f'전체 날짜 컬럼 {len(all_dates)}개 / {month}월 날짜 컬럼 {len(target_dates)}개')
-    if target_dates: st.code(', '.join(str(x[0]) for x in target_dates))
+# ============================================================
+# READ FILE
+# ============================================================
 
-mapping_file=st.file_uploader('선택: 라인 → 창고 매핑 파일 (라인, 창고)',type=['xlsx','xls','csv'],key='mapping')
-mapping=None
-if mapping_file:
-    try:
-        ms=read_file(mapping_file); mn=st.selectbox('매핑 시트',list(ms.keys()),key='mapping_sheet'); mapping=ms[mn].copy(); mapping.columns=[clean(c) for c in mapping.columns]
-        if not {'라인','창고'}.issubset(mapping.columns): st.error('매핑 파일에는 라인, 창고 컬럼이 필요합니다.'); mapping=None
-        else: st.dataframe(mapping[['라인','창고']].drop_duplicates(),use_container_width=True,hide_index=True)
-    except Exception as e: st.error(f'매핑 파일 오류: {e}'); mapping=None
-else: st.warning('창고 매핑이 없으므로 모든 데이터가 미매핑으로 표시됩니다.')
+try:
 
-try: data,dcols=transform(raw,int(year),int(month),mapping,roundup)
-except Exception as e: st.error(f'데이터 변환 실패: {e}'); st.stop()
+    sheets = read_uploaded_file(
+        uploaded_file
+    )
 
-raw_pcs=sum(numeric(raw[c]).sum() for c,_,_ in dcols); trans_pcs=data['입고 PCS'].sum(); diff=raw_pcs-trans_pcs
-st.subheader('✅ 데이터 검증')
-v1,v2,v3,v4,v5=st.columns(5); v1.metric('원본 날짜 PCS',f'{raw_pcs:,.0f}'); v2.metric('변환 후 PCS',f'{trans_pcs:,.0f}'); v3.metric('차이',f'{diff:,.0f}'); v4.metric('SKU 수',f"{data['SKU ID'].nunique():,}"); v5.metric('데이터 행',f'{len(data):,}')
-if abs(diff)>0.01: st.warning('⚠️ 원본 날짜 PCS와 변환 후 PCS가 다릅니다. 중복 헤더/날짜 범위/원본 값을 확인하세요.')
-else: st.success('원본 날짜 PCS와 변환 후 PCS가 일치합니다.')
+except Exception as e:
 
-st.divider(); st.subheader('📊 입고 예정 현황')
-kp1,kp2,kp3,kp4=st.columns(4); kp1.metric('총 입고 예정 PLT',f"{data['입고 PLT'].sum():,.0f}"); kp2.metric('총 입고 예정 PCS',f"{data['입고 PCS'].sum():,.0f}"); kp3.metric('입고 SKU 수',f"{data['SKU ID'].nunique():,}"); kp4.metric('최대 일일 PLT',f"{data.groupby('입고일자')['입고 PLT'].sum().max():,.0f}")
+    st.error(
+        f"파일을 읽을 수 없습니다: {e}"
+    )
 
-st.subheader('🔎 Dashboard 필터')
-f1,f2,f3=st.columns(3); whs=sorted(data['창고'].dropna().unique()); lines=sorted(data['라인'].dropna().unique())
-sel_wh=f1.multiselect('창고',whs,default=whs); sel_line=f2.multiselect('라인',lines,default=lines)
-mi,ma=data['입고일자'].min().date(),data['입고일자'].max().date(); dates=f3.date_input('입고일자',value=(mi,ma),min_value=mi,max_value=ma)
-start,end=(pd.Timestamp(dates[0]),pd.Timestamp(dates[1])) if isinstance(dates,tuple) and len(dates)==2 else (pd.Timestamp(mi),pd.Timestamp(ma))
-f=data[data['창고'].isin(sel_wh)&data['라인'].isin(sel_line)&data['입고일자'].between(start,end)].copy()
+    st.stop()
 
-st.subheader('① 일자별 전체 입고 예정 PLT')
-daily=f.groupby('입고일자',as_index=False)['입고 PLT'].sum(); fig=px.line(daily,x='입고일자',y='입고 PLT',markers=True); fig.update_layout(margin=dict(l=20,r=20,t=20,b=20)); st.plotly_chart(fig,use_container_width=True)
 
-st.subheader('② 창고별 일자별 입고 예정 PLT')
-wd=f.groupby(['입고일자','창고'],as_index=False)['입고 PLT'].sum(); fig=px.bar(wd,x='입고일자',y='입고 PLT',color='창고',barmode='stack'); fig.update_layout(margin=dict(l=20,r=20,t=20,b=20)); st.plotly_chart(fig,use_container_width=True)
+# ============================================================
+# SHEET
+# ============================================================
 
-st.subheader('③ 창고별 총 입고 예정 PLT')
-wt=f.groupby('창고',as_index=False)['입고 PLT'].sum().sort_values('입고 PLT'); fig=px.bar(wt,x='입고 PLT',y='창고',orientation='h',text_auto='.0f'); fig.update_layout(margin=dict(l=20,r=20,t=20,b=20)); st.plotly_chart(fig,use_container_width=True)
+sheet_name = st.selectbox(
+    "사용할 시트",
+    list(sheets.keys()),
+)
 
-st.subheader('④ 품목별 입고 예정 PLT TOP 10')
-top=f.groupby(['SKU ID','제품명'],as_index=False)['입고 PLT'].sum().sort_values('입고 PLT',ascending=False).head(10).sort_values('입고 PLT'); top['표시명']=top['SKU ID']+' | '+top['제품명']; fig=px.bar(top,x='입고 PLT',y='표시명',orientation='h',text_auto='.0f'); fig.update_layout(margin=dict(l=20,r=20,t=20,b=20)); st.plotly_chart(fig,use_container_width=True)
+raw_df = sheets[
+    sheet_name
+].copy()
 
-st.subheader('⑤ 일자별 창고 입고 집중도')
-heat=f.groupby(['창고','입고일자'],as_index=False)['입고 PLT'].sum().pivot(index='창고',columns='입고일자',values='입고 PLT').fillna(0); fig=px.imshow(heat,aspect='auto',text_auto='.0f',labels={'x':'입고일자','y':'창고','color':'입고 PLT'}); fig.update_layout(margin=dict(l=20,r=20,t=20,b=20)); st.plotly_chart(fig,use_container_width=True)
+if raw_df.empty:
 
-with st.expander('📋 변환된 입고 DATA 보기'):
-    cols=['입고일자','창고','라인','SKU ID','제품명','입고 PCS','팔레트당 PCS','입고 PLT']; st.dataframe(f[cols],use_container_width=True,hide_index=True); st.download_button('⬇️ CSV 다운로드',f[cols].to_csv(index=False,encoding='utf-8-sig'),file_name=f'inbound_data_{year}_{month:02d}.csv',mime='text/csv')
+    st.error(
+        "선택한 시트에 데이터가 없습니다."
+    )
+
+    st.stop()
+
+
+raw_df.columns = [
+    clean_col_name(column)
+    for column in raw_df.columns
+]
+
+
+# ============================================================
+# COLUMN MAPPING
+# ============================================================
+
+st.subheader(
+    "데이터 인식"
+)
+
+mapping = detect_source_columns(
+    raw_df
+)
+
+mapping_display = {
+    "SKU ID":
+        mapping["sku"],
+
+    "제품명":
+        mapping["product"],
+
+    "바코드":
+        mapping["barcode"],
+
+    "구분/라인":
+        mapping["category"],
+
+    "팔레트당 제품 수량":
+        mapping["pallet_qty"],
+}
+
+st.dataframe(
+    pd.DataFrame(
+        {
+            "항목":
+                list(
+                    mapping_display.keys()
+                ),
+
+            "원본 컬럼":
+                list(
+                    mapping_display.values()
+                ),
+        }
+    ),
+    hide_index=True,
+    use_container_width=True,
+)
+
+
+# ============================================================
+# DATE COLUMNS
+# ============================================================
+
+date_columns = detect_date_columns(
+    raw_df,
+    target_year,
+    target_month,
+)
+
+if not date_columns:
+
+    st.error(
+        f"{target_year}년 "
+        f"{target_month}월 날짜 컬럼을 "
+        "찾지 못했습니다."
+    )
+
+    st.stop()
+
+
+st.success(
+    f"{len(date_columns)}개 날짜 컬럼 인식"
+)
+
+
+# ============================================================
+# TRANSFORM
+# ============================================================
+
+try:
+
+    inbound_data = (
+        transform_inbound_data(
+            raw_df,
+            date_columns,
+            mapping,
+            round_partial,
+        )
+    )
+
+except Exception as e:
+
+    st.error(
+        f"데이터 변환 중 오류가 발생했습니다: {e}"
+    )
+
+    st.stop()
+
+
+if inbound_data.empty:
+
+    st.warning(
+        "선택한 월에 입고 예정 PCS가 없습니다."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+validation = make_validation(
+    inbound_data
+)
+
+st.subheader(
+    "데이터 검증"
+)
+
+c1, c2, c3, c4 = st.columns(4)
+
+c1.metric(
+    "전체 입고 PCS",
+    f"{validation['전체 입고 PCS']:,.0f}",
+)
+
+c2.metric(
+    "전체 입고 예정 PLT",
+    f"{validation['전체 입고 예정 PLT']:,.0f}",
+)
+
+c3.metric(
+    "SKU 수",
+    f"{validation['SKU 수']:,}",
+)
+
+c4.metric(
+    "미매핑 건수",
+    f"{validation['미매핑 건수']:,}",
+)
+
+if validation["미매핑 건수"] > 0:
+
+    st.warning(
+        "미매핑 데이터가 있습니다."
+    )
+
+if validation["팔레트 수량 누락"] > 0:
+
+    st.warning(
+        "팔레트당 제품 수량이 없거나 "
+        "0인 데이터가 있습니다."
+    )
+
+
+# ============================================================
+# FILTER
+# ============================================================
+
+st.subheader(
+    "필터"
+)
+
+f1, f2 = st.columns(2)
+
+warehouse_options = sorted(
+    inbound_data[
+        "창고"
+    ]
+    .dropna()
+    .unique()
+    .tolist()
+)
+
+category_options = sorted(
+    inbound_data[
+        "구분"
+    ]
+    .dropna()
+    .unique()
+    .tolist()
+)
+
+with f1:
+
+    selected_warehouses = st.multiselect(
+        "창고",
+        warehouse_options,
+        default=warehouse_options,
+    )
+
+with f2:
+
+    selected_categories = st.multiselect(
+        "구분/라인",
+        category_options,
+        default=category_options,
+    )
+
+
+filtered = inbound_data[
+    inbound_data["창고"].isin(
+        selected_warehouses
+    )
+    &
+    inbound_data["구분"].isin(
+        selected_categories
+    )
+].copy()
+
+
+if filtered.empty:
+
+    st.warning(
+        "현재 필터 조건에 해당하는 "
+        "데이터가 없습니다."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# KPI
+# ============================================================
+
+daily_plt = (
+    filtered
+    .groupby(
+        "입고일자",
+        as_index=False,
+    )[
+        "입고 예정 PLT"
+    ]
+    .sum()
+    .sort_values(
+        "입고일자"
+    )
+)
+
+total_plt = (
+    filtered[
+        "입고 예정 PLT"
+    ].sum()
+)
+
+total_pcs = (
+    filtered[
+        "입고 PCS"
+    ].sum()
+)
+
+sku_count = (
+    filtered[
+        "SKU ID"
+    ].nunique()
+)
+
+max_daily_plt = (
+    daily_plt[
+        "입고 예정 PLT"
+    ].max()
+)
+
+
+k1, k2, k3, k4 = st.columns(4)
+
+k1.metric(
+    "입고 예정 PLT",
+    f"{total_plt:,.0f}",
+)
+
+k2.metric(
+    "입고 예정 PCS",
+    f"{total_pcs:,.0f}",
+)
+
+k3.metric(
+    "SKU",
+    f"{sku_count:,}",
+)
+
+k4.metric(
+    "일 최대 입고 PLT",
+    f"{max_daily_plt:,.0f}",
+)
+
+
+# ============================================================
+# CHART 1
+# 일자별 전체 입고 예정 PLT 추이
+# ============================================================
+
+st.subheader(
+    "1. 일자별 전체 입고 예정 PLT 추이"
+)
+
+fig1 = px.line(
+    daily_plt,
+    x="입고일자",
+    y="입고 예정 PLT",
+    markers=True,
+)
+
+fig1.update_layout(
+    xaxis_title="입고일자",
+    yaxis_title="입고 예정 PLT",
+    hovermode="x unified",
+    height=420,
+)
+
+st.plotly_chart(
+    fig1,
+    use_container_width=True,
+)
+
+
+# ============================================================
+# CHART 2
+# 창고별 일자별 입고 예정 PLT
+# ============================================================
+
+st.subheader(
+    "2. 창고별 일자별 입고 예정 PLT"
+)
+
+warehouse_daily = (
+    filtered
+    .groupby(
+        [
+            "입고일자",
+            "창고",
+        ],
+        as_index=False,
+    )[
+        "입고 예정 PLT"
+    ]
+    .sum()
+    .sort_values(
+        "입고일자"
+    )
+)
+
+fig2 = px.bar(
+    warehouse_daily,
+    x="입고일자",
+    y="입고 예정 PLT",
+    color="창고",
+    barmode="stack",
+)
+
+fig2.update_layout(
+    xaxis_title="입고일자",
+    yaxis_title="입고 예정 PLT",
+    height=500,
+)
+
+st.plotly_chart(
+    fig2,
+    use_container_width=True,
+)
+
+
+# ============================================================
+# CHART 3
+# 창고별 총 입고 예정 PLT 구성
+# ============================================================
+
+st.subheader(
+    "3. 창고별 총 입고 예정 PLT 구성"
+)
+
+warehouse_total = (
+    filtered
+    .groupby(
+        "창고",
+        as_index=False,
+    )[
+        "입고 예정 PLT"
+    ]
+    .sum()
+    .sort_values(
+        "입고 예정 PLT",
+        ascending=True,
+    )
+)
+
+fig3 = px.bar(
+    warehouse_total,
+    x="입고 예정 PLT",
+    y="창고",
+    orientation="h",
+    text="입고 예정 PLT",
+)
+
+fig3.update_layout(
+    xaxis_title="입고 예정 PLT",
+    yaxis_title="창고",
+    height=450,
+)
+
+st.plotly_chart(
+    fig3,
+    use_container_width=True,
+)
+
+
+# ============================================================
+# CHART 4
+# 품목별 입고 예정 PLT TOP 10
+# ============================================================
+
+st.subheader(
+    "4. 품목별 입고 예정 PLT TOP 10"
+)
+
+sku_top10 = (
+    filtered
+    .groupby(
+        [
+            "SKU ID",
+            "제품명",
+        ],
+        as_index=False,
+    )[
+        "입고 예정 PLT"
+    ]
+    .sum()
+    .sort_values(
+        "입고 예정 PLT",
+        ascending=False,
+    )
+    .head(10)
+)
+
+sku_top10["품목"] = (
+    sku_top10["제품명"]
+    + " ("
+    + sku_top10["SKU ID"]
+    + ")"
+)
+
+fig4 = px.bar(
+    sku_top10.sort_values(
+        "입고 예정 PLT"
+    ),
+    x="입고 예정 PLT",
+    y="품목",
+    orientation="h",
+    text="입고 예정 PLT",
+)
+
+fig4.update_layout(
+    xaxis_title="입고 예정 PLT",
+    yaxis_title="품목",
+    height=500,
+)
+
+st.plotly_chart(
+    fig4,
+    use_container_width=True,
+)
+
+
+# ============================================================
+# CHART 5
+# 일자별 창고 입고 집중도
+# ============================================================
+
+st.subheader(
+    "5. 일자별 창고 입고 집중도"
+)
+
+heatmap_data = (
+    filtered
+    .pivot_table(
+        index="입고일자",
+        columns="창고",
+        values="입고 예정 PLT",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    .sort_index()
+)
+
+fig5 = px.imshow(
+    heatmap_data,
+    aspect="auto",
+    labels={
+        "x": "창고",
+        "y": "입고일자",
+        "color": "입고 예정 PLT",
+    },
+)
+
+fig5.update_layout(
+    height=600,
+)
+
+st.plotly_chart(
+    fig5,
+    use_container_width=True,
+)
+
+
+# ============================================================
+# UNMAPPED DATA
+# ============================================================
+
+st.subheader(
+    "창고 미매핑 데이터"
+)
+
+unmapped = (
+    inbound_data[
+        inbound_data["창고"]
+        == "미매핑"
+    ]
+    .groupby(
+        [
+            "구분",
+            "제품명",
+            "SKU ID",
+        ],
+        as_index=False,
+    )[
+        "입고 PCS"
+    ]
+    .sum()
+    .sort_values(
+        "입고 PCS",
+        ascending=False,
+    )
+)
+
+if unmapped.empty:
+
+    st.success(
+        "미매핑 데이터가 없습니다."
+    )
+
+else:
+
+    st.dataframe(
+        unmapped,
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# FINAL DATA
+# ============================================================
+
+st.subheader(
+    "변환된 입고 DATA"
+)
+
+display_columns = [
+    "입고일자",
+    "창고",
+    "구분",
+    "SKU ID",
+    "제품명",
+    "바코드",
+    "입고 PCS",
+    "팔레트당 제품 수량",
+    "입고 예정 PLT",
+]
+
+display_df = filtered[
+    display_columns
+].copy()
+
+st.dataframe(
+    display_df,
+    hide_index=True,
+    use_container_width=True,
+    height=500,
+)
+
+
+# ============================================================
+# DOWNLOAD
+# ============================================================
+
+csv_data = display_df.to_csv(
+    index=False,
+    encoding="utf-8-sig",
+)
+
+st.download_button(
+    label="📥 변환된 입고 DATA CSV 다운로드",
+    data=csv_data,
+    file_name=(
+        f"inbound_plt_"
+        f"{target_year}_"
+        f"{target_month:02d}.csv"
+    ),
+    mime="text/csv",
+)
+```
