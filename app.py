@@ -9,12 +9,12 @@ import streamlit as st
 # PAGE CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="올리브영 출고 매핑 & LOT 자동 배정 (그레이스 WMS)",
+    page_title="올리브영 자동 출고 & LOT 매핑 (그레이스 3PL)",
     page_icon="📦",
     layout="wide",
 )
 
-MIN_SHELF_LIFE_DAYS = 547  # 올리브영 납품 기준 잔여 유통기한 (1년 6개월 = 약 547일)
+MIN_SHELF_LIFE_DAYS = 547  # 올리브영 납품 기준 잔여 유통기한 (1년 6개월 = 547일)
 
 # ============================================================
 # DATA CLEANING HELPERS
@@ -37,22 +37,22 @@ def parse_number(val):
         return 0
 
 # ============================================================
-# UNIVERSAL FILE READER (XLS / XLSX / CSV / HTML EXCEL ALL SUPPORTED)
+# AUTOMATIC FILE PARSER (.xls, .xlsx, HTML, CSV 모두 자동 대응)
 # ============================================================
 def load_uploaded_file(uploaded_file):
     """
-    .xls 파일이 실제 97-2003 바이너리이든, HTML 텍스트 기반 엑셀이든, CSV/XLSX이든
-    변환 과정 없이 그대로 자동 감지하여 DataFrame으로 읽어옵니다.
+    WMS에서 받은 .xls 파일이 어떤 형태이든(바이너리, HTML-based 엑셀, CSV 등)
+    사용자의 추가 작업 없이 자동으로 엔진을 맞춰 읽어옵니다.
     """
     raw_bytes = uploaded_file.getvalue()
     
-    # 1. 일반 read_excel 시도 (openpyxl, xlrd 엔진 자동 선택)
+    # 1. Excel (openpyxl / xlrd) 시도
     try:
         return pd.read_excel(BytesIO(raw_bytes), header=None)
     except Exception:
         pass
 
-    # 2. HTML Table 형태의 엑셀 파일일 경우 처리 (.xls 파일 중 웹 다운로드용)
+    # 2. HTML Table 형태의 .xls 엑셀 파일 시도
     try:
         html_dfs = pd.read_html(BytesIO(raw_bytes))
         if html_dfs:
@@ -60,14 +60,14 @@ def load_uploaded_file(uploaded_file):
     except Exception:
         pass
 
-    # 3. CSV 및 다양한 인코딩 시도
+    # 3. CSV 시도 (인코딩 자동 대조)
     for encoding in ["utf-8-sig", "cp949", "euc-kr", "utf-8", "latin1"]:
         try:
             return pd.read_csv(BytesIO(raw_bytes), encoding=encoding, header=None)
         except Exception:
             continue
 
-    raise ValueError("파일 형식을 파싱할 수 없습니다. 파일이 손상되었거나 지원되지 않는 형식입니다.")
+    raise ValueError("파일을 정상적으로 읽을 수 없습니다. 파일 상태를 확인해주세요.")
 
 # ============================================================
 # WMS & DELIVERY FILE PARSERS
@@ -76,7 +76,6 @@ def parse_grace_wms(df_raw):
     """
     그레이스 3PL WMS 재고 현황 파싱
     """
-    # 헤더 위치 탐색 (상품코드 / LOT / 바코드 등이 있는 행)
     header_idx = None
     for idx, row in df_raw.iterrows():
         row_str = " ".join(row.dropna().astype(str))
@@ -85,7 +84,7 @@ def parse_grace_wms(df_raw):
             break
 
     if header_idx is None:
-        header_idx = 1  # 기본 헤더 행 위치
+        header_idx = 1
 
     df = df_raw.iloc[header_idx + 1:].copy()
     
@@ -137,7 +136,6 @@ def parse_oliveyoung_delivery(df_raw):
     df = df[df["상품코드"].notna() & (df["상품코드"] != "")].copy()
     df["상품코드"] = df["상품코드"].apply(clean_str)
     
-    # 컬럼명 유연 대응
     req_col = [c for c in df.columns if "발주수량" in c]
     box_col = [c for c in df.columns if "BOX" in c and "입수" in c]
     
@@ -152,7 +150,7 @@ def parse_oliveyoung_delivery(df_raw):
 # ============================================================
 def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
     """
-    FEFO 기반 LOT 자동 매핑 및 출고검증 로직
+    FEFO 기반 LOT 자동 매핑 및 유통기한/BOX입수/LOT쪼개짐 검증
     """
     wms_work = wms_df.copy()
     wms_work["가용재고_남은수량"] = wms_work["가용재고"]
@@ -173,7 +171,7 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
 
         if not matched_wms.empty:
             matched_wms["잔여일수"] = (matched_wms["유통기한"] - target_date).dt.days
-            # FEFO: 유통기한 빠른 순 정렬
+            # 유통기한 빠른 순(FEFO) 정렬
             valid_wms = matched_wms[matched_wms["잔여일수"] >= min_days].sort_values("유통기한")
             invalid_wms = matched_wms[matched_wms["잔여일수"] < min_days]
         else:
@@ -266,12 +264,12 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("1. 그레이스 WMS 재고현황")
-    # type 옵션을 제거하여 .xls 확장자 업로드 차단을 우회
-    wms_file = st.file_uploader("재고현황 파일 (모든 .xls / .xlsx 지원)", key="wms")
+    # type 파라미터를 완전히 제거하여 .xls 확장자 업로드 차단을 해제함
+    wms_file = st.file_uploader("WMS 재고현황 파일 (.xls, .xlsx 파일 그대로 업로드)", key="wms")
 
 with col2:
     st.subheader("2. 올리브영 납품확인서")
-    delivery_file = st.file_uploader("납품확인서 목록 파일", key="delivery")
+    delivery_file = st.file_uploader("납품확인서 목록 파일 (.xlsx)", key="delivery")
 
 if wms_file and delivery_file:
     try:
@@ -281,9 +279,9 @@ if wms_file and delivery_file:
         wms_df = parse_grace_wms(wms_raw)
         delivery_df = parse_oliveyoung_delivery(delivery_raw)
 
-        st.success(f"✅ 파일 읽기 완료! (WMS 재고: {len(wms_df)}건 / 납품 항목: {len(delivery_df)}건)")
+        st.success(f"✅ 파일 자동 읽기 성공! (WMS 가용재고: {len(wms_df)}건 / 올리브영 납품항목: {len(delivery_df)}건)")
 
-        if st.button("🚀 LOT 자동 매핑 및 검증 실행", type="primary"):
+        if st.button("🚀 LOT 자동 매핑 및 출고 검증 실행", type="primary"):
             result_df, updated_wms = allocate_inventory(delivery_df, wms_df, min_days=min_days_limit)
 
             st.subheader("📊 자동 매핑 및 출고 검증 결과")
@@ -320,4 +318,4 @@ if wms_file and delivery_file:
     except Exception as e:
         st.error(f"데이터 처리 중 오류가 발생했습니다: {e}")
 else:
-    st.info("💡 좌측/우측 상단에 각각 WMS 재고현황 파일과 올리브영 납품확인서 파일을 업로드해주세요.")
+    st.info("💡 팀원들은 WMS에서 다운로드한 .xls 원본 파일을 수정 없이 그대로 올려주시면 됩니다.")
