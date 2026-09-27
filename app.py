@@ -37,6 +37,39 @@ def parse_number(val):
         return 0
 
 # ============================================================
+# UNIVERSAL FILE READER (XLS / XLSX / CSV / HTML EXCEL ALL SUPPORTED)
+# ============================================================
+def load_uploaded_file(uploaded_file):
+    """
+    .xls 파일이 실제 97-2003 바이너리이든, HTML 텍스트 기반 엑셀이든, CSV/XLSX이든
+    변환 과정 없이 그대로 자동 감지하여 DataFrame으로 읽어옵니다.
+    """
+    raw_bytes = uploaded_file.getvalue()
+    
+    # 1. 일반 read_excel 시도 (openpyxl, xlrd 엔진 자동 선택)
+    try:
+        return pd.read_excel(BytesIO(raw_bytes), header=None)
+    except Exception:
+        pass
+
+    # 2. HTML Table 형태의 엑셀 파일일 경우 처리 (.xls 파일 중 웹 다운로드용)
+    try:
+        html_dfs = pd.read_html(BytesIO(raw_bytes))
+        if html_dfs:
+            return html_dfs[0]
+    except Exception:
+        pass
+
+    # 3. CSV 및 다양한 인코딩 시도
+    for encoding in ["utf-8-sig", "cp949", "euc-kr", "utf-8", "latin1"]:
+        try:
+            return pd.read_csv(BytesIO(raw_bytes), encoding=encoding, header=None)
+        except Exception:
+            continue
+
+    raise ValueError("파일 형식을 파싱할 수 없습니다. 파일이 손상되었거나 지원되지 않는 형식입니다.")
+
+# ============================================================
 # WMS & DELIVERY FILE PARSERS
 # ============================================================
 def parse_grace_wms(df_raw):
@@ -52,11 +85,10 @@ def parse_grace_wms(df_raw):
             break
 
     if header_idx is None:
-        header_idx = 1  # 기본값
+        header_idx = 1  # 기본 헤더 행 위치
 
     df = df_raw.iloc[header_idx + 1:].copy()
     
-    # 열 위치 추정 (0:구분/자사코드, 1:상품코드, 2:상품명, 3:LOT, 4:유통기한, 6:바코드, 7:창고, 10:가용재고)
     parsed_rows = []
     for _, row in df.iterrows():
         wms_sku = clean_str(row.iloc[1]) if len(row) > 1 else ""
@@ -91,7 +123,6 @@ def parse_oliveyoung_delivery(df_raw):
     """
     올리브영 납품확인서 목록 파싱
     """
-    # 헤더 찾기
     header_idx = 0
     for idx, row in df_raw.iterrows():
         row_str = " ".join(row.dropna().astype(str))
@@ -103,11 +134,15 @@ def parse_oliveyoung_delivery(df_raw):
     df.columns = df.iloc[header_idx].map(clean_str)
     df = df.iloc[header_idx + 1:].reset_index(drop=True)
 
-    # 필요 컬럼 가공
     df = df[df["상품코드"].notna() & (df["상품코드"] != "")].copy()
     df["상품코드"] = df["상품코드"].apply(clean_str)
-    df["발주수량(EA)"] = df["발주수량\n(EA)"].apply(parse_number) if "발주수량\n(EA)" in df.columns else df["발주수량(EA)"].apply(parse_number)
-    df["BOX입수"] = df["BOX\n입수"].apply(parse_number) if "BOX\n입수" in df.columns else df["BOX입수"].apply(parse_number)
+    
+    # 컬럼명 유연 대응
+    req_col = [c for c in df.columns if "발주수량" in c]
+    box_col = [c for c in df.columns if "BOX" in c and "입수" in c]
+    
+    df["발주수량(EA)"] = df[req_col[0]].apply(parse_number) if req_col else 0
+    df["BOX입수"] = df[box_col[0]].apply(parse_number) if box_col else 1
     df["입고예정일"] = pd.to_datetime(df["입고예정일"], errors="coerce")
 
     return df
@@ -136,10 +171,9 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
         # 1차 바코드 매칭 -> 2차 SKU 매칭
         matched_wms = wms_work[(wms_work["바코드"] == barcode) | (wms_work["WMS상품코드"] == barcode)].copy()
 
-        # 잔여 유통기한 계산
         if not matched_wms.empty:
             matched_wms["잔여일수"] = (matched_wms["유통기한"] - target_date).dt.days
-            # FEFO: 유통기한 임박순 정렬
+            # FEFO: 유통기한 빠른 순 정렬
             valid_wms = matched_wms[matched_wms["잔여일수"] >= min_days].sort_values("유통기한")
             invalid_wms = matched_wms[matched_wms["잔여일수"] < min_days]
         else:
@@ -152,9 +186,9 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
 
         if valid_wms.empty:
             if not invalid_wms.empty:
-                status = "INVALID_SHELF_LIFE"  # 유통기한 부족
+                status = "INVALID_SHELF_LIFE"
             else:
-                status = "NO_STOCK"  # 재고 없음
+                status = "NO_STOCK"
         else:
             for w_idx, w_row in valid_wms.iterrows():
                 if remaining_to_pick <= 0:
@@ -177,9 +211,8 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
                 })
 
             if remaining_to_pick > 0:
-                status = "SHORTAGE"  # 수량 부족
+                status = "SHORTAGE"
 
-        # 상태 판정 및 요약
         lot_summary = []
         exp_summary = []
         is_split = len(picked_lots) > 1
@@ -198,7 +231,6 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
         elif is_split:
             status_flag = "⚠️ [주의] LOT 쪼개짐 (다중 LOT)"
 
-        # 박스 입수 단위 검증
         box_check = "OK"
         if box_in > 0 and (req_qty % box_in != 0):
             box_check = f"❌ 박스미달 (입수:{int(box_in)})"
@@ -234,29 +266,28 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("1. 그레이스 WMS 재고현황")
-    wms_file = st.file_uploader("재고현황 파일 (.xls, .xlsx)", type=["xls", "xlsx"], key="wms")
+    # type 옵션을 제거하여 .xls 확장자 업로드 차단을 우회
+    wms_file = st.file_uploader("재고현황 파일 (모든 .xls / .xlsx 지원)", key="wms")
 
 with col2:
     st.subheader("2. 올리브영 납품확인서")
-    delivery_file = st.file_uploader("납품확인서 목록 파일 (.xlsx)", type=["xlsx"], key="delivery")
+    delivery_file = st.file_uploader("납품확인서 목록 파일", key="delivery")
 
 if wms_file and delivery_file:
     try:
-        wms_raw = pd.read_excel(wms_file, header=None)
-        delivery_raw = pd.read_excel(delivery_file)
+        wms_raw = load_uploaded_file(wms_file)
+        delivery_raw = load_uploaded_file(delivery_file)
 
         wms_df = parse_grace_wms(wms_raw)
         delivery_df = parse_oliveyoung_delivery(delivery_raw)
 
         st.success(f"✅ 파일 읽기 완료! (WMS 재고: {len(wms_df)}건 / 납품 항목: {len(delivery_df)}건)")
 
-        # 실행 버튼
         if st.button("🚀 LOT 자동 매핑 및 검증 실행", type="primary"):
             result_df, updated_wms = allocate_inventory(delivery_df, wms_df, min_days=min_days_limit)
 
             st.subheader("📊 자동 매핑 및 출고 검증 결과")
 
-            # KPI 요약
             k1, k2, k3, k4 = st.columns(4)
             normal_cnt = sum(result_df["매핑상태"].str.contains("정상출고"))
             split_cnt = sum(result_df["LOT split 여부"] == "O")
@@ -268,13 +299,11 @@ if wms_file and delivery_file:
             k3.metric("⛔ 유통기한 부적합", f"{invalid_cnt} 건")
             k4.metric("🔴 재고 부족/없음", f"{shortage_cnt} 건")
 
-            # 필터 기능
             status_filter = st.multiselect("상태별 필터링", result_df["매핑상태"].unique(), default=result_df["매핑상태"].unique())
             filtered_result = result_df[result_df["매핑상태"].isin(status_filter)]
 
             st.dataframe(filtered_result, use_container_width=True, height=450)
 
-            # Excel 다운로드 제공
             output = BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 filtered_result.to_excel(writer, index=False, sheet_name="올리브영_LOT매핑결과")
