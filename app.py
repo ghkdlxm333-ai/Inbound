@@ -36,7 +36,7 @@ def parse_number(val):
         return 0
 
 # ============================================================
-# AUTOMATIC FILE PARSER (.xls, .xlsx, HTML, CSV 모두 스마트 파싱)
+# AUTOMATIC FILE PARSER
 # ============================================================
 def load_uploaded_file(uploaded_file):
     raw_bytes = uploaded_file.getvalue()
@@ -303,10 +303,10 @@ if wms_file and delivery_file:
             status_filter = st.multiselect("상태별 필터링", result_df["매핑상태"].unique(), default=result_df["매핑상태"].unique())
             filtered_result = result_df[result_df["매핑상태"].isin(status_filter)]
 
-            # 요청된 순서대로 표 출력
+            # [바코드, 상품코드, 상품명, BOX입수, 출고수량, LOT, 유통기한] 순서로 출력
             st.dataframe(filtered_result, use_container_width=True, height=500)
 
-            # Excel 다운로드 제공
+            # Excel 다운로드
             output = BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 filtered_result.to_excel(writer, index=False, sheet_name="올리브영_LOT매핑결과")
